@@ -56,7 +56,73 @@ class PBIDocumenter:
                         "Visible": "No" if "isHidden" in rest else "Sí",
                         "Descripción": re.search(r'description:\s+"(.*?)"', rest).group(1) if 'description:' in rest else ""
                     })
-        return pd.DataFrame(tables), pd.DataFrame(columns), pd.DataFrame(measures)
+
+        return (
+            pd.DataFrame(tables),
+            pd.DataFrame(columns) if columns else pd.DataFrame(columns=["Tabla", "Campo", "Tipo Dato", "Visible", "Descripción"]),
+            pd.DataFrame(measures) if measures else pd.DataFrame(columns=["Tabla", "Medida", "DAX", "Formato", "Visible", "Descripción"])
+        )
+    
+    def parse_relationships(self):
+        rels = []
+
+        # -----------------------------
+        # 1) relationships.tmdl (tu caso real)
+        # -----------------------------
+        rel_tmdl = os.path.join(self.model_path, "definition", "relationships.tmdl")
+        if os.path.exists(rel_tmdl):
+            with open(rel_tmdl, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            blocks = re.split(r"\brelationship\b", content)
+            for block in blocks[1:]:
+                from_col = re.search(r"fromColumn:\s*([^\n\r]+)", block)
+                to_col = re.search(r"toColumn:\s*([^\n\r]+)", block)
+                from_card = re.search(r"fromCardinality:\s*([^\n\r]+)", block)
+
+                if from_col and to_col:
+                    from_full = from_col.group(1).strip()
+                    to_full = to_col.group(1).strip()
+
+                    # Separar tabla.columna
+                    if "." in from_full:
+                        from_table, from_column = from_full.split(".", 1)
+                    else:
+                        from_table, from_column = "", from_full
+
+                    if "." in to_full:
+                        to_table, to_column = to_full.split(".", 1)
+                    else:
+                        to_table, to_column = "", to_full
+
+                    # Interpretar cardinalidad (con supuestos)
+                    card = ""
+                    if from_card:
+                        raw = from_card.group(1).strip().lower()
+                        if raw == "one":
+                            card = "One-to-One"
+                        elif raw == "many":
+                            card = "One-to-Many"
+                    else:
+                        # Sin info explícita: asumimos Many-to-One (from = many, to = one)
+                        card = "Many-to-One"
+
+                    rels.append({
+                        "Origen": from_table,
+                        "Campo O": from_column,
+                        "Destino": to_table,
+                        "Campo D": to_column,
+                        "Cardinalidad": card
+                    })
+
+        # -----------------------------
+        # 2) DataFrame final
+        # -----------------------------
+        if not rels:
+            print("⚠ No se detectaron relaciones en relationships.tmdl")
+            return pd.DataFrame(columns=["Origen", "Campo O", "Destino", "Campo D", "Cardinalidad"])
+
+        return pd.DataFrame(rels)
 
     def get_report_visuals(self):
         visuals = []
@@ -84,10 +150,21 @@ class PBIDocumenter:
                             v_type = json.load(f).get('visual', {}).get('visualType', 'Otro')
                             if v_type not in ignore:
                                 visuals.append({"Hoja": p_name, "Tipo de Objeto": mapping.get(v_type, v_type), "ID Técnico": v_folder})
-        return pd.DataFrame(visuals)
+        df = pd.DataFrame(visuals)
+        if df.empty:
+            df = pd.DataFrame(columns=["Hoja", "Tipo de Objeto", "ID Técnico"])
+        return df
+
+    def write_df(self, writer, df, sheet_name):
+        if df.empty:
+            # Crear una fila vacía para que Excel muestre encabezados
+            empty_row = {col: "" for col in df.columns}
+            df = pd.DataFrame([empty_row])
+        df.to_excel(writer, sheet_name=sheet_name, index=False)
 
     def generate_excel(self):
         df_t, df_c, df_m = self.parse_tmdl_files()
+        df_r = self.parse_relationships()
         df_p = self.get_report_visuals()
         name = os.path.basename(self.root_path.strip('/\\'))
         
@@ -96,12 +173,12 @@ class PBIDocumenter:
             doc = [["Documentación"], [""], ["Reporte:", name], [""], ["Objetivo:", ""], [""], ["Workspace:", ""], [""], ["Actualizaciones:", ""]]
             pd.DataFrame(doc).to_excel(writer, sheet_name='Documentación', index=False, header=False)
             
-            # 2. Resto de hojas
-            df_t.to_excel(writer, sheet_name='Tablas', index=False)
-            pd.DataFrame(columns=["Origen", "Campo O", "Destino", "Campo D", "Cardinalidad"]).to_excel(writer, sheet_name='Relaciones', index=False)
-            df_c.to_excel(writer, sheet_name='Campos', index=False)
-            df_m.to_excel(writer, sheet_name='Medidas', index=False)
-            df_p.to_excel(writer, sheet_name='Hojas', index=False)
+            # 2. Otras hojas
+            self.write_df(writer, df_t, 'Tablas')
+            self.write_df(writer, df_r, 'Relaciones')
+            self.write_df(writer, df_c, 'Campos')
+            self.write_df(writer, df_m, 'Medidas')
+            self.write_df(writer, df_p, 'Hojas')
 
             # --- Formato Final ---
             for sheet in writer.sheets:
