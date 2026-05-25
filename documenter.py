@@ -19,56 +19,193 @@ class PBIDocumenter:
 
     def parse_tmdl_files(self):
         tables, columns, measures = [], [], []
-        if not self.tables_path: return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+        # -----------------------------
+        # 1) Leer model.json para obtener descripciones de tablas y columnas
+        # -----------------------------
+        model_json = os.path.join(self.model_path, "definition", "model.json")
+        table_descriptions = {}
+        column_descriptions = {}
+
+        if os.path.exists(model_json):
+            with open(model_json, "r", encoding="utf-8") as f:
+                model = json.load(f)
+
+            for t in model.get("tables", []):
+                t_name = t.get("name")
+                t_desc = t.get("description", "")
+                table_descriptions[t_name] = t_desc
+
+                for c in t.get("columns", []):
+                    c_name = c.get("name")
+                    c_desc = c.get("description", "")
+                    column_descriptions[(t_name, c_name)] = c_desc
+
+        # -----------------------------
+        # 2) Procesar archivos .tmdl
+        # -----------------------------
+        if not self.tables_path:
+            return (
+                pd.DataFrame(),
+                pd.DataFrame(),
+                pd.DataFrame()
+            )
 
         for file in os.listdir(self.tables_path):
-            if not file.endswith('.tmdl'): continue
+            if not file.endswith('.tmdl'):
+                continue
+
             with open(os.path.join(self.tables_path, file), 'r', encoding='utf-8') as f:
                 content = f.read()
                 table_name = file.replace('.tmdl', '')
                 header = content.split("column")[0]
 
+                # -----------------------------
+                # TABLAS
+                # -----------------------------
                 tables.append({
                     "Nombre": table_name,
                     "Modo": re.search(r"mode:\s+(\w+)", header).group(1) if "mode:" in header else "Import",
-                    "Tipo": "DAX (Calculada)" if "partition " + table_name + " = calculated" in content else "Power Query",
+                    "Tipo": "DAX (Calculada)" if f"partition {table_name} = calculated" in content else "Power Query",
                     "Visible": "No" if "isHidden" in header else "Sí",
-                    "Descripción": re.search(r'description:\s+"(.*?)"', header).group(1) if 'description:' in header else ""
+                    "Descripción": table_descriptions.get(table_name, "")
                 })
 
-                col_blocks = re.finditer(r"column\s+([\w\s'-]+)(.*?)(?=\n\s+(column|measure|partition|annotation)|$)", content, re.DOTALL)
-                for m in col_blocks:
-                    body = m.group(2)
+                # ============================================================
+                # 3) MEDIDAS — SE PARSEAN PRIMERO Y SE ELIMINAN DEL CONTENIDO
+                # ============================================================
+                local_measures = []
+
+                def remove_measures(match):
+                    comment = match.group(1) or ""
+                    measure_name = match.group(2).strip()
+                    body = match.group(3)
+
+                    descripcion = comment.strip()
+
+                    local_measures.append({
+                        "Tabla": table_name,
+                        "Medida": measure_name,
+                        "DAX": body.split('\n')[0].strip(),
+                        "Formato": re.search(r"formatString:\s+(.+)", body).group(1) if "formatString" in body else "-",
+                        "Visible": "No" if "isHidden" in body else "Sí",
+                        "Descripción": descripcion
+                    })
+
+                    return ""  # Eliminamos el bloque completo
+
+                # NUEVO REGEX: captura TODAS las medidas
+                content_no_measures = re.sub(
+                    r"(?:\s*///\s*(.*?)\s*)?"          # comentario opcional
+                    r"\s*measure\s+'?([^'=]+)'?\s*=\s*(.*?)"  # nombre y DAX
+                    r"(?=\s*(measure|column|partition|annotation|$))",  # fin del bloque
+                    remove_measures,
+                    content,
+                    flags=re.DOTALL
+                )
+
+                measures.extend(local_measures)
+
+
+
+                # ============================================================
+                # 4) COLUMNAS — AHORA EL CONTENIDO YA NO TIENE MEDIDAS
+                # ============================================================
+                col_pattern = re.finditer(
+                    r"(?:\n\s*///\s*(.*?)\s*\n\s*column\s+([^\n\r]+)|\n\s*column\s+([^\n\r]+))"
+                    r"(.*?)(?=\n\s*(column|partition|annotation)|$)",
+                    content_no_measures,
+                    re.DOTALL
+                )
+
+                for m in col_pattern:
+                    comment = m.group(1) or ""
+                    col_def_line = m.group(2) or m.group(3)
+                    body = m.group(4)
+
+                    col_name = re.split(r"\s+dataType\b", col_def_line, flags=re.IGNORECASE)[0]
+                    col_name = col_name.strip().replace("'", "")
+
+                    descripcion = (
+                        comment.strip()
+                        or column_descriptions.get((table_name, col_name), "")
+                        or (re.search(r'description:\s+"(.*?)"', body).group(1) if 'description:' in body else "")
+                    )
+
                     columns.append({
-                        "Tabla": table_name, "Campo": m.group(1).strip().replace("'", ""),
+                        "Tabla": table_name,
+                        "Campo": col_name,
                         "Tipo Dato": re.search(r"dataType:\s+(\w+)", body).group(1) if "dataType" in body else "Inferred",
                         "Visible": "No" if "isHidden" in body else "Sí",
-                        "Descripción": re.search(r'description:\s+"(.*?)"', body).group(1) if 'description:' in body else ""
+                        "Descripción": descripcion
                     })
 
-                meas_blocks = re.finditer(r"measure\s+'?([^'=]+)'?\s+=\s+(.+?)(?=\n\s+(measure|column|partition|annotation)|$)", content, re.DOTALL)
-                for m in meas_blocks:
-                    rest = m.group(2)
-                    measures.append({
-                        "Tabla": table_name, "Medida": m.group(1).strip(), 
-                        "DAX": rest.split('\n')[0].strip(),
-                        "Formato": re.search(r"formatString:\s+(.+)", rest).group(1) if "formatString" in rest else "-",
-                        "Visible": "No" if "isHidden" in rest else "Sí",
-                        "Descripción": re.search(r'description:\s+"(.*?)"', rest).group(1) if 'description:' in rest else ""
-                    })
-
+        # -----------------------------
+        # 5) DataFrames finales
+        # -----------------------------
         return (
             pd.DataFrame(tables),
             pd.DataFrame(columns) if columns else pd.DataFrame(columns=["Tabla", "Campo", "Tipo Dato", "Visible", "Descripción"]),
             pd.DataFrame(measures) if measures else pd.DataFrame(columns=["Tabla", "Medida", "DAX", "Formato", "Visible", "Descripción"])
         )
-    
+
+    def get_power_query_tables(self):
+        expressions_file = os.path.join(self.model_path, "definition", "expressions.tmdl")
+
+        if not os.path.exists(expressions_file):
+            return pd.DataFrame(columns=["Query", "Tipo", "Cargada al modelo"])
+
+        with open(expressions_file, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Extraer bloques de expresiones
+        expr_blocks = re.finditer(
+            r"expression\s+([\w_]+)\s*=\s*(.*?)(?=\n\s*expression|\Z)",
+            content,
+            re.DOTALL
+        )
+
+        expressions = []
+        for m in expr_blocks:
+            name = m.group(1)
+            block = m.group(2)
+
+            # Detectar tipo: Table o Function
+            if "PBI_ResultType = Table" in block:
+                tipo = "Table"
+            elif "PBI_ResultType = Function" in block:
+                tipo = "Function"
+            else:
+                tipo = "Unknown"
+
+            expressions.append((name, tipo))
+
+        # Tablas cargadas al modelo (TMDL)
+        model_tables = []
+        if self.tables_path:
+            model_tables = [
+                t.replace(".tmdl", "")
+                for t in os.listdir(self.tables_path)
+                if t.endswith(".tmdl")
+            ]
+
+        rows = []
+        for name, tipo in expressions:
+            # Si es tabla y está en TMDL → NO la incluimos
+            if tipo == "Table" and name in model_tables:
+                continue
+
+            rows.append({
+                "Query": name,
+                "Tipo": tipo,
+                "Cargada al modelo": "No"
+            })
+
+        return pd.DataFrame(rows)
+
     def parse_relationships(self):
         rels = []
 
-        # -----------------------------
-        # 1) relationships.tmdl (tu caso real)
-        # -----------------------------
         rel_tmdl = os.path.join(self.model_path, "definition", "relationships.tmdl")
         if os.path.exists(rel_tmdl):
             with open(rel_tmdl, "r", encoding="utf-8") as f:
@@ -78,48 +215,34 @@ class PBIDocumenter:
             for block in blocks[1:]:
                 from_col = re.search(r"fromColumn:\s*([^\n\r]+)", block)
                 to_col = re.search(r"toColumn:\s*([^\n\r]+)", block)
-                from_card = re.search(r"fromCardinality:\s*([^\n\r]+)", block)
 
-                if from_col and to_col:
-                    from_full = from_col.group(1).strip()
-                    to_full = to_col.group(1).strip()
+                if not from_col or not to_col:
+                    continue
 
-                    # Separar tabla.columna
-                    if "." in from_full:
-                        from_table, from_column = from_full.split(".", 1)
-                    else:
-                        from_table, from_column = "", from_full
+                from_full = from_col.group(1).strip()
+                to_full = to_col.group(1).strip()
 
-                    if "." in to_full:
-                        to_table, to_column = to_full.split(".", 1)
-                    else:
-                        to_table, to_column = "", to_full
+                from_table, from_column = from_full.split(".", 1) if "." in from_full else ("", from_full)
+                to_table, to_column = to_full.split(".", 1) if "." in to_full else ("", to_full)
 
-                    # Interpretar cardinalidad (con supuestos)
-                    card = ""
-                    if from_card:
-                        raw = from_card.group(1).strip().lower()
-                        if raw == "one":
-                            card = "One-to-One"
-                        elif raw == "many":
-                            card = "One-to-Many"
-                    else:
-                        # Sin info explícita: asumimos Many-to-One (from = many, to = one)
-                        card = "Many-to-One"
+                # Detectar cardinalidad real
+                if "toCardinality: many" in block:
+                    card = "N:N"
+                elif "fromCardinality: one" in block:
+                    card = "1:1"
+                else:
+                    # Caso por defecto → 1:N
+                    card = "1:N"
 
-                    rels.append({
-                        "Origen": from_table,
-                        "Campo O": from_column,
-                        "Destino": to_table,
-                        "Campo D": to_column,
-                        "Cardinalidad": card
-                    })
+                rels.append({
+                    "Origen": from_table,
+                    "Campo O": from_column,
+                    "Destino": to_table,
+                    "Campo D": to_column,
+                    "Cardinalidad": card
+                })
 
-        # -----------------------------
-        # 2) DataFrame final
-        # -----------------------------
         if not rels:
-            print("⚠ No se detectaron relaciones en relationships.tmdl")
             return pd.DataFrame(columns=["Origen", "Campo O", "Destino", "Campo D", "Cardinalidad"])
 
         return pd.DataFrame(rels)
@@ -166,6 +289,7 @@ class PBIDocumenter:
         df_t, df_c, df_m = self.parse_tmdl_files()
         df_r = self.parse_relationships()
         df_p = self.get_report_visuals()
+        df_pq = self.get_power_query_tables()
         name = os.path.basename(self.root_path.strip('/\\'))
         
         with pd.ExcelWriter("Documentacion_PBI.xlsx", engine='openpyxl') as writer:
@@ -175,6 +299,7 @@ class PBIDocumenter:
             
             # 2. Otras hojas
             self.write_df(writer, df_t, 'Tablas')
+            self.write_df(writer, df_pq, 'Power Query')
             self.write_df(writer, df_r, 'Relaciones')
             self.write_df(writer, df_c, 'Campos')
             self.write_df(writer, df_m, 'Medidas')
