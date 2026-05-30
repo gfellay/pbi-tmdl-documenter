@@ -21,7 +21,7 @@ class PBIDocumenter:
         tables, columns, measures = [], [], []
 
         # -----------------------------
-        # 1) Leer model.json para obtener descripciones de tablas y columnas
+        # 1) Leer model.json (si existe)
         # -----------------------------
         model_json = os.path.join(self.model_path, "definition", "model.json")
         table_descriptions = {}
@@ -58,17 +58,32 @@ class PBIDocumenter:
             with open(os.path.join(self.tables_path, file), 'r', encoding='utf-8') as f:
                 content = f.read()
                 table_name = file.replace('.tmdl', '')
-                header = content.split("column")[0]
 
                 # -----------------------------
-                # TABLAS
+                # DESCRIPCIÓN DE TABLA
                 # -----------------------------
+                table_comment = ""
+                m = re.search(
+                    r"///\s*(.*?)\s*\n\s*table\s+" + re.escape(table_name),
+                    content
+                )
+                if m:
+                    table_comment = m.group(1).strip()
+
+                # ELIMINAR el comentario de tabla del contenido
+                content = re.sub(
+                    r"\s*///\s*.*?\s*(?=table\s+" + re.escape(table_name) + ")",
+                    "",
+                    content,
+                    flags=re.DOTALL
+                )
+
                 tables.append({
                     "Nombre": table_name,
-                    "Modo": re.search(r"mode:\s+(\w+)", header).group(1) if "mode:" in header else "Import",
-                    "Tipo": "DAX (Calculada)" if f"partition {table_name} = calculated" in content else "Power Query",
-                    "Visible": "No" if "isHidden" in header else "Sí",
-                    "Descripción": table_descriptions.get(table_name, "")
+                    "Modo": "Import",
+                    "Tipo": "Power Query",
+                    "Visible": "Sí",
+                    "Descripción": table_comment or table_descriptions.get(table_name, "")
                 })
 
                 # ============================================================
@@ -86,7 +101,7 @@ class PBIDocumenter:
                     local_measures.append({
                         "Tabla": table_name,
                         "Medida": measure_name,
-                        "DAX": body.split('\n')[0].strip(),
+                        "DAX": re.split(r"\n\s+[a-zA-Z]+\s*[:=]", body)[0].strip(),
                         "Formato": re.search(r"formatString:\s+(.+)", body).group(1) if "formatString" in body else "-",
                         "Visible": "No" if "isHidden" in body else "Sí",
                         "Descripción": descripcion
@@ -94,7 +109,7 @@ class PBIDocumenter:
 
                     return ""  # Eliminamos el bloque completo
 
-                # NUEVO REGEX: captura TODAS las medidas
+                # REGEX DEFINITIVO: captura TODAS las medidas
                 content_no_measures = re.sub(
                     r"(?:\s*///\s*(.*?)\s*)?"          # comentario opcional
                     r"\s*measure\s+'?([^'=]+)'?\s*=\s*(.*?)"  # nombre y DAX
@@ -106,14 +121,12 @@ class PBIDocumenter:
 
                 measures.extend(local_measures)
 
-
-
                 # ============================================================
                 # 4) COLUMNAS — AHORA EL CONTENIDO YA NO TIENE MEDIDAS
                 # ============================================================
                 col_pattern = re.finditer(
-                    r"(?:\n\s*///\s*(.*?)\s*\n\s*column\s+([^\n\r]+)|\n\s*column\s+([^\n\r]+))"
-                    r"(.*?)(?=\n\s*(column|partition|annotation)|$)",
+                    r"(?:\s*///\s*(.*?)\s*\n\s*column\s+([^\n\r]+)|\s*column\s+([^\n\r]+))"
+                    r"(.*?)(?=\s*(column|partition|annotation|$))",
                     content_no_measures,
                     re.DOTALL
                 )
@@ -123,6 +136,7 @@ class PBIDocumenter:
                     col_def_line = m.group(2) or m.group(3)
                     body = m.group(4)
 
+                    # Nombre de columna (antes de dataType)
                     col_name = re.split(r"\s+dataType\b", col_def_line, flags=re.IGNORECASE)[0]
                     col_name = col_name.strip().replace("'", "")
 
@@ -148,6 +162,7 @@ class PBIDocumenter:
             pd.DataFrame(columns) if columns else pd.DataFrame(columns=["Tabla", "Campo", "Tipo Dato", "Visible", "Descripción"]),
             pd.DataFrame(measures) if measures else pd.DataFrame(columns=["Tabla", "Medida", "DAX", "Formato", "Visible", "Descripción"])
         )
+
 
     def get_power_query_tables(self):
         expressions_file = os.path.join(self.model_path, "definition", "expressions.tmdl")
@@ -232,7 +247,7 @@ class PBIDocumenter:
                     card = "1:1"
                 else:
                     # Caso por defecto → 1:N
-                    card = "1:N"
+                    card = "N:1"
 
                 rels.append({
                     "Origen": from_table,
