@@ -1,3 +1,5 @@
 echo "__pycache__/" > .gitignore
 echo "*.xlsx" >> .gitignore
 echo ".venv/" >> .gitignore
+*.xlsx
+*.xls
